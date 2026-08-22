@@ -1,0 +1,13 @@
+[package]
+name = "fastexport-jsonl"
+version = "0.1.0"
+edition = "2021"
+authors = ["chris-a83"]
+license = "MIT"
+description = "Strict, reversible conversion between git fast-export streams and JSON Lines"
+
+[[bin]]
+name = "fastexport-jsonl"
+path = "src/main.rs"
+
+[dependencies]
