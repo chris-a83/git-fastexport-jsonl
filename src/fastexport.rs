@@ -569,3 +569,80 @@ fn quote_path_if_needed(path: &str) -> String {
     out.push('"');
     out
 }
+
+// These tests parse a hand-written stream, round it all the way through the
+// JSON Lines representation (to_json -> compact string -> json::parse ->
+// from_json), write it back out, and check the result is byte-for-byte
+// identical to the input. That's the property the whole tool exists for: if
+// this ever breaks, going through JSON is lossy and nothing downstream can
+// be trusted.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::json;
+
+    fn round_trip(stream: &str) -> Vec<u8> {
+        let opts = ParseOptions { lenient: false };
+        let events = parse(stream.as_bytes(), &opts).expect("stream should parse");
+
+        let mut jsonl = String::new();
+        for event in &events {
+            jsonl.push_str(&event.to_json().to_compact_string());
+            jsonl.push('\n');
+        }
+
+        let mut rebuilt = Vec::new();
+        for line in jsonl.lines() {
+            let value = json::parse(line).expect("jsonl line should parse");
+            rebuilt.push(Event::from_json(&value, false).expect("event should reparse"));
+        }
+
+        write(&rebuilt)
+    }
+
+    #[test]
+    fn round_trips_blob_commit_merge_reset_done() {
+        let stream = "blob\n\
+mark :1\n\
+data 5\n\
+hello\n\
+commit refs/heads/main\n\
+mark :2\n\
+author A U Thor <author@example.com> 1112911993 -0700\n\
+committer C O Mitter <committer@example.com> 1112911993 -0700\n\
+data 10\n\
+first work\n\
+M 100644 :1 file.txt\n\
+\n\
+commit refs/heads/main\n\
+mark :3\n\
+committer C O Mitter <committer@example.com> 1112912000 -0700\n\
+data 11\n\
+second work\n\
+from :2\n\
+merge :2\n\
+M 100755 inline exec.sh\n\
+data 6\n\
+binary\n\
+D old.txt\n\
+\n\
+reset refs/heads/main\n\
+from :3\n\
+done\n";
+
+        assert_eq!(round_trip(stream), stream.as_bytes());
+    }
+
+    #[test]
+    fn round_trips_minimal_commit_with_sha1_dataref() {
+        let stream = "commit refs/heads/main\n\
+committer C O Mitter <committer@example.com> 1112911993 -0700\n\
+data 4\n\
+fix!\n\
+M 100644 da39a3ee5e6b4b0d3255bfef95601890afd80709 file.txt\n\
+\n\
+done\n";
+
+        assert_eq!(round_trip(stream), stream.as_bytes());
+    }
+}
