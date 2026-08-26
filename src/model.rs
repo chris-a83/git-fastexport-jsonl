@@ -22,6 +22,12 @@ pub struct FileModify {
 pub enum FileChange {
     Modify(FileModify),
     Delete { path: String },
+    Note(NoteModify),
+}
+
+pub struct NoteModify {
+    pub dataref: DataRef,
+    pub commitish: String,
 }
 
 pub struct Commit {
@@ -45,10 +51,19 @@ pub struct Reset {
     pub from: Option<String>,
 }
 
+pub struct Tag {
+    pub name: String,
+    pub mark: Option<u64>,
+    pub from: String,
+    pub tagger: Option<PersonStamp>,
+    pub message: Vec<u8>,
+}
+
 pub enum Event {
     Blob(Blob),
     Commit(Commit),
     Reset(Reset),
+    Tag(Tag),
     Done,
 }
 
@@ -66,6 +81,20 @@ impl Event {
                 ("from".to_string(), optional_string(&reset.from)),
             ]),
             Event::Done => Value::Object(vec![("type".to_string(), Value::String("done".to_string()))]),
+            Event::Tag(tag) => {
+                let tagger = match &tag.tagger {
+                    Some(person) => person.to_json(),
+                    None => Value::Null,
+                };
+                Value::Object(vec![
+                    ("type".to_string(), Value::String("tag".to_string())),
+                    ("name".to_string(), Value::String(tag.name.clone())),
+                    ("mark".to_string(), optional_mark(tag.mark)),
+                    ("from".to_string(), Value::String(tag.from.clone())),
+                    ("tagger".to_string(), tagger),
+                    ("message_base64".to_string(), Value::String(base64_encode(&tag.message))),
+                ])
+            }
             Event::Commit(commit) => {
                 let author = match &commit.author {
                     Some(person) => person.to_json(),
@@ -116,6 +145,32 @@ impl Event {
                 Ok(Event::Reset(Reset { branch, from }))
             }
             "done" => Ok(Event::Done),
+            "tag" => {
+                let name = value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "tag missing \"name\"".to_string())?
+                    .to_string();
+                let mark = match value.get("mark") {
+                    Some(Value::Number(n)) => Some(*n as u64),
+                    _ => None,
+                };
+                let from = value
+                    .get("from")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "tag missing \"from\"".to_string())?
+                    .to_string();
+                let tagger = match value.get("tagger") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(PersonStamp::from_json(v, lenient)?),
+                };
+                let message_b64 = value
+                    .get("message_base64")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "tag missing \"message_base64\"".to_string())?;
+                let message = base64_decode(message_b64)?;
+                Ok(Event::Tag(Tag { name, mark, from, tagger, message }))
+            }
             "commit" => {
                 let branch = value
                     .get("branch")
@@ -223,33 +278,39 @@ pub fn is_valid_tz_offset(s: &str) -> bool {
     bytes.len() == 5 && (bytes[0] == b'+' || bytes[0] == b'-') && bytes[1..].iter().all(u8::is_ascii_digit)
 }
 
+fn dataref_to_json(dataref: &DataRef) -> Value {
+    match dataref {
+        DataRef::Mark(id) => Value::Object(vec![
+            ("kind".to_string(), Value::String("mark".to_string())),
+            ("value".to_string(), Value::Number(*id as i64)),
+        ]),
+        DataRef::Sha1(sha) => Value::Object(vec![
+            ("kind".to_string(), Value::String("sha1".to_string())),
+            ("value".to_string(), Value::String(sha.clone())),
+        ]),
+        DataRef::Inline(data) => Value::Object(vec![
+            ("kind".to_string(), Value::String("inline".to_string())),
+            ("data_base64".to_string(), Value::String(base64_encode(data))),
+        ]),
+    }
+}
+
 fn file_change_to_json(change: &FileChange) -> Value {
     match change {
-        FileChange::Modify(modify) => {
-            let dataref = match &modify.dataref {
-                DataRef::Mark(id) => Value::Object(vec![
-                    ("kind".to_string(), Value::String("mark".to_string())),
-                    ("value".to_string(), Value::Number(*id as i64)),
-                ]),
-                DataRef::Sha1(sha) => Value::Object(vec![
-                    ("kind".to_string(), Value::String("sha1".to_string())),
-                    ("value".to_string(), Value::String(sha.clone())),
-                ]),
-                DataRef::Inline(data) => Value::Object(vec![
-                    ("kind".to_string(), Value::String("inline".to_string())),
-                    ("data_base64".to_string(), Value::String(base64_encode(data))),
-                ]),
-            };
-            Value::Object(vec![
-                ("op".to_string(), Value::String("M".to_string())),
-                ("mode".to_string(), Value::String(modify.mode.clone())),
-                ("dataref".to_string(), dataref),
-                ("path".to_string(), Value::String(modify.path.clone())),
-            ])
-        }
+        FileChange::Modify(modify) => Value::Object(vec![
+            ("op".to_string(), Value::String("M".to_string())),
+            ("mode".to_string(), Value::String(modify.mode.clone())),
+            ("dataref".to_string(), dataref_to_json(&modify.dataref)),
+            ("path".to_string(), Value::String(modify.path.clone())),
+        ]),
         FileChange::Delete { path } => Value::Object(vec![
             ("op".to_string(), Value::String("D".to_string())),
             ("path".to_string(), Value::String(path.clone())),
+        ]),
+        FileChange::Note(note) => Value::Object(vec![
+            ("op".to_string(), Value::String("N".to_string())),
+            ("dataref".to_string(), dataref_to_json(&note.dataref)),
+            ("commitish".to_string(), Value::String(note.commitish.clone())),
         ]),
     }
 }
@@ -278,38 +339,50 @@ fn file_change_from_json(value: &Value) -> Result<FileChange, String> {
                 .to_string();
             let dataref_value =
                 value.get("dataref").ok_or_else(|| "filemodify missing \"dataref\"".to_string())?;
-            let kind = dataref_value
-                .get("kind")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "dataref missing \"kind\"".to_string())?;
-            let dataref = match kind {
-                "mark" => {
-                    let id = dataref_value
-                        .get("value")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| "mark dataref missing \"value\"".to_string())?;
-                    DataRef::Mark(id as u64)
-                }
-                "sha1" => {
-                    let sha = dataref_value
-                        .get("value")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "sha1 dataref missing \"value\"".to_string())?
-                        .to_string();
-                    DataRef::Sha1(sha)
-                }
-                "inline" => {
-                    let data_b64 = dataref_value
-                        .get("data_base64")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| "inline dataref missing \"data_base64\"".to_string())?;
-                    DataRef::Inline(base64_decode(data_b64)?)
-                }
-                other => return Err(format!("unknown dataref kind: {}", other)),
-            };
+            let dataref = dataref_from_json(dataref_value)?;
             Ok(FileChange::Modify(FileModify { mode, dataref, path }))
         }
+        "N" => {
+            let dataref_value =
+                value.get("dataref").ok_or_else(|| "notemodify missing \"dataref\"".to_string())?;
+            let dataref = dataref_from_json(dataref_value)?;
+            let commitish = value
+                .get("commitish")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "notemodify missing \"commitish\"".to_string())?
+                .to_string();
+            Ok(FileChange::Note(NoteModify { dataref, commitish }))
+        }
         other => Err(format!("unknown file change op: {}", other)),
+    }
+}
+
+fn dataref_from_json(value: &Value) -> Result<DataRef, String> {
+    let kind = value.get("kind").and_then(Value::as_str).ok_or_else(|| "dataref missing \"kind\"".to_string())?;
+    match kind {
+        "mark" => {
+            let id = value
+                .get("value")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| "mark dataref missing \"value\"".to_string())?;
+            Ok(DataRef::Mark(id as u64))
+        }
+        "sha1" => {
+            let sha = value
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "sha1 dataref missing \"value\"".to_string())?
+                .to_string();
+            Ok(DataRef::Sha1(sha))
+        }
+        "inline" => {
+            let data_b64 = value
+                .get("data_base64")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "inline dataref missing \"data_base64\"".to_string())?;
+            Ok(DataRef::Inline(base64_decode(data_b64)?))
+        }
+        other => Err(format!("unknown dataref kind: {}", other)),
     }
 }
 

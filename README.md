@@ -80,9 +80,8 @@ for blob data are both hand-rolled in `src/`.
 
 ## Current limitations
 
-- `tag`, `notemodify`, `filecopy`, `filerename`, `deleteall`, `ls`, and
-  `checkpoint` commands aren't parsed yet (strict mode errors on them,
-  lenient mode skips the line)
+- `filecopy`, `filerename`, `deleteall`, `ls`, and `checkpoint` commands
+  aren't parsed yet (strict mode errors on them, lenient mode skips the line)
 - the delimited `data <<DELIM` form isn't supported, only exact byte counts
 - the whole stream is read into memory rather than processed incrementally
 
