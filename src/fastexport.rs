@@ -1,8 +1,11 @@
 // Reader and writer for the text stream produced by `git fast-export` and
 // consumed by `git fast-import`. Only the subset of commands that shows up in
 // an ordinary linear-to-moderately-branched export is handled: blob, commit,
-// reset, tag, notemodify, and done. Copies/renames, deleteall, and the
-// delimited `data <<EOF` form are out of scope for now (see README).
+// reset, tag, notemodify, and done. Copies/renames and deleteall are out of
+// scope for now (see README). Both forms of `data` are accepted on input
+// (exact byte count and delimited `<<EOF`); output always uses the exact
+// byte count form, since it's unambiguous and easier for downstream tools to
+// parse.
 
 use std::collections::HashSet;
 
@@ -327,11 +330,8 @@ fn parse_data(cur: &mut Cursor, opts: &ParseOptions) -> Result<Vec<u8>, ParseErr
         line: line_no,
         message: format!("expected data command, found: {}", String::from_utf8_lossy(line)),
     })?;
-    if rest.starts_with(b"<<") {
-        return Err(ParseError {
-            line: line_no,
-            message: "delimited data format (data <<DELIM) is not supported".to_string(),
-        });
+    if let Some(delim) = rest.strip_prefix(b"<<") {
+        return parse_delimited_data(cur, delim, line_no, opts);
     }
     let count_str = std::str::from_utf8(rest)
         .map_err(|_| ParseError { line: line_no, message: "data length is not valid UTF-8".to_string() })?
@@ -349,6 +349,40 @@ fn parse_data(cur: &mut Cursor, opts: &ParseOptions) -> Result<Vec<u8>, ParseErr
         });
     }
     Ok(data)
+}
+
+// The delimited form (`data <<DELIM`) has no declared length: the payload is
+// whatever comes before a line that matches DELIM exactly. We can't peek
+// ahead for that line without risking a false match inside binary content
+// that happens to contain the delimiter bytes preceded by a newline, so we
+// take git's own reading of the grammar: scan line by line and treat the
+// first line-for-line match as the terminator.
+fn parse_delimited_data(cur: &mut Cursor, delim: &[u8], line_no: usize, opts: &ParseOptions) -> Result<Vec<u8>, ParseError> {
+    if delim.is_empty() {
+        return Err(ParseError { line: line_no, message: "empty delimiter in data <<DELIM".to_string() });
+    }
+    let mut data = Vec::new();
+    loop {
+        match cur.read_line() {
+            Some((_, line)) if line == delim => return Ok(data),
+            Some((_, line)) => {
+                data.extend_from_slice(line);
+                data.push(b'\n');
+            }
+            None => {
+                if opts.lenient {
+                    return Ok(data);
+                }
+                return Err(ParseError {
+                    line: cur.line,
+                    message: format!(
+                        "unterminated delimited data block, expected a line matching '{}'",
+                        String::from_utf8_lossy(delim)
+                    ),
+                });
+            }
+        }
+    }
 }
 
 fn parse_mark_id(bytes: &[u8], line_no: usize) -> Result<u64, ParseError> {
@@ -802,5 +836,66 @@ M 100644 da39a3ee5e6b4b0d3255bfef95601890afd80709 file.txt\n\
 done\n";
 
         assert_eq!(round_trip(stream), stream.as_bytes());
+    }
+
+    #[test]
+    fn parses_delimited_data_and_writes_it_back_as_exact_count() {
+        let stream = "blob\n\
+mark :1\n\
+data <<BLOBEOF\n\
+hello\n\
+world\n\
+BLOBEOF\n\
+commit refs/heads/main\n\
+committer C O Mitter <committer@example.com> 1112911993 -0700\n\
+data <<MSGEOF\n\
+a message\n\
+MSGEOF\n\
+M 100644 :1 file.txt\n\
+\n\
+done\n";
+
+        let expected = "blob\n\
+mark :1\n\
+data 12\n\
+hello\n\
+world\n\
+\n\
+commit refs/heads/main\n\
+committer C O Mitter <committer@example.com> 1112911993 -0700\n\
+data 10\n\
+a message\n\
+\n\
+M 100644 :1 file.txt\n\
+\n\
+done\n";
+
+        let opts = ParseOptions { lenient: false };
+        let events = parse(stream.as_bytes(), &opts).expect("stream should parse");
+        assert_eq!(write(&events), expected.as_bytes());
+    }
+
+    #[test]
+    fn delimiter_line_containing_delimiter_as_substring_is_not_a_match() {
+        // A raw line of "BLOBEOFX" must not be mistaken for the "BLOBEOF"
+        // terminator; only an exact line match ends the block.
+        let stream = "blob\n\
+data <<BLOBEOF\n\
+BLOBEOFX\n\
+BLOBEOF\n";
+
+        let opts = ParseOptions { lenient: false };
+        let events = parse(stream.as_bytes(), &opts).expect("stream should parse");
+        match &events[0] {
+            Event::Blob(blob) => assert_eq!(blob.data, b"BLOBEOFX\n"),
+            _ => panic!("expected a blob event"),
+        }
+    }
+
+    #[test]
+    fn unterminated_delimited_data_is_a_strict_error() {
+        let stream = "blob\ndata <<EOF\nno terminator here\n";
+        let opts = ParseOptions { lenient: false };
+        assert!(parse(stream.as_bytes(), &opts).is_err());
     }
 }
