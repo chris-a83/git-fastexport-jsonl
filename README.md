@@ -80,8 +80,8 @@ for blob data are both hand-rolled in `src/`.
 
 ## Current limitations
 
-- `filecopy`, `filerename`, `deleteall`, `ls`, and `checkpoint` commands
-  aren't parsed yet (strict mode errors on them, lenient mode skips the line)
+- `ls` and `checkpoint` commands aren't parsed yet (strict mode errors on
+  them, lenient mode skips the line)
 - the whole stream is read into memory rather than processed incrementally
 
 Both `data` forms are accepted on input — the exact byte count form and the

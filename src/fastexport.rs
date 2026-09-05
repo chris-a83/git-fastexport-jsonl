@@ -1,11 +1,11 @@
 // Reader and writer for the text stream produced by `git fast-export` and
 // consumed by `git fast-import`. Only the subset of commands that shows up in
 // an ordinary linear-to-moderately-branched export is handled: blob, commit,
-// reset, tag, notemodify, and done. Copies/renames and deleteall are out of
-// scope for now (see README). Both forms of `data` are accepted on input
-// (exact byte count and delimited `<<EOF`); output always uses the exact
-// byte count form, since it's unambiguous and easier for downstream tools to
-// parse.
+// reset, tag, notemodify, filecopy, filerename, deleteall, and done. `ls` and
+// `checkpoint` are out of scope for now (see README). Both forms of `data`
+// are accepted on input (exact byte count and delimited `<<EOF`); output
+// always uses the exact byte count form, since it's unambiguous and easier
+// for downstream tools to parse.
 
 use std::collections::HashSet;
 
@@ -235,6 +235,22 @@ fn parse_commit(
                 let (line_no, line) = cur.read_line().unwrap();
                 let rest = strip_prefix(line, b"N ").unwrap();
                 file_changes.push(FileChange::Note(parse_notemodify(rest, cur, opts, known_marks, line_no)?));
+            }
+            Some(line) if strip_prefix(line, b"C ").is_some() => {
+                let (line_no, line) = cur.read_line().unwrap();
+                let rest = strip_prefix(line, b"C ").unwrap();
+                let (src, dst) = parse_two_paths(rest, opts, line_no)?;
+                file_changes.push(FileChange::Copy { src, dst });
+            }
+            Some(line) if strip_prefix(line, b"R ").is_some() => {
+                let (line_no, line) = cur.read_line().unwrap();
+                let rest = strip_prefix(line, b"R ").unwrap();
+                let (src, dst) = parse_two_paths(rest, opts, line_no)?;
+                file_changes.push(FileChange::Rename { src, dst });
+            }
+            Some(line) if line == b"deleteall" => {
+                cur.read_line();
+                file_changes.push(FileChange::DeleteAll);
             }
             _ => break,
         }
@@ -497,6 +513,48 @@ fn is_valid_sha1(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+// filecopy and filerename each carry two paths on one line. The first is not
+// the last field, so an unquoted copy of it can't contain a space (there'd be
+// no way to tell where it ends); git quotes it whenever that's needed. The
+// second path is the last field, so it's read the same way D's path is: to
+// the end of the line, quoted or not.
+fn parse_two_paths(rest: &[u8], opts: &ParseOptions, line_no: usize) -> Result<(String, String), ParseError> {
+    let (first_bytes, remainder) = split_leading_path(rest, opts, line_no)?;
+    let first = unquote_path(first_bytes, opts, line_no)?;
+    let second = unquote_path(remainder, opts, line_no)?;
+    Ok((first, second))
+}
+
+fn split_leading_path<'a>(bytes: &'a [u8], opts: &ParseOptions, line_no: usize) -> Result<(&'a [u8], &'a [u8]), ParseError> {
+    if bytes.first() == Some(&b'"') {
+        let mut i = 1;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                let rest = &bytes[i + 1..];
+                return match rest.strip_prefix(b" ") {
+                    Some(after) => Ok((&bytes[..=i], after)),
+                    None if opts.lenient => Ok((&bytes[..=i], rest)),
+                    None => Err(ParseError { line: line_no, message: "expected a space after quoted path".to_string() }),
+                };
+            }
+            i += 1;
+        }
+        if opts.lenient {
+            return Ok((bytes, b""));
+        }
+        return Err(ParseError { line: line_no, message: "unterminated quoted path".to_string() });
+    }
+    match bytes.iter().position(|&b| b == b' ') {
+        Some(idx) => Ok((&bytes[..idx], &bytes[idx + 1..])),
+        None if opts.lenient => Ok((bytes, b"")),
+        None => Err(ParseError { line: line_no, message: "expected two paths separated by a space".to_string() }),
+    }
+}
+
 fn unquote_path(bytes: &[u8], opts: &ParseOptions, line_no: usize) -> Result<String, ParseError> {
     if bytes.first() == Some(&b'"') {
         if bytes.len() < 2 || bytes.last() != Some(&b'"') {
@@ -654,6 +712,21 @@ fn write_file_change(out: &mut Vec<u8>, change: &FileChange) {
             out.extend_from_slice(quote_path_if_needed(path).as_bytes());
             out.push(b'\n');
         }
+        FileChange::Copy { src, dst } => {
+            out.extend_from_slice(b"C ");
+            out.extend_from_slice(quote_leading_path(src).as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(quote_path_if_needed(dst).as_bytes());
+            out.push(b'\n');
+        }
+        FileChange::Rename { src, dst } => {
+            out.extend_from_slice(b"R ");
+            out.extend_from_slice(quote_leading_path(src).as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(quote_path_if_needed(dst).as_bytes());
+            out.push(b'\n');
+        }
+        FileChange::DeleteAll => out.extend_from_slice(b"deleteall\n"),
         FileChange::Note(note) => {
             out.extend_from_slice(b"N ");
             match &note.dataref {
@@ -692,7 +765,16 @@ fn write_tag(out: &mut Vec<u8>, tag: &Tag) {
 }
 
 fn quote_path_if_needed(path: &str) -> String {
-    let needs_quoting = path.chars().any(|c| c == '"' || c == '\\' || (c as u32) < 0x20);
+    quote_path(path, path.chars().any(|c| c == '"' || c == '\\' || (c as u32) < 0x20))
+}
+
+// The first path in a filecopy/filerename line isn't the last field, so a
+// literal space in it would be ambiguous with the separator unless quoted.
+fn quote_leading_path(path: &str) -> String {
+    quote_path(path, path.chars().any(|c| c == '"' || c == '\\' || c == ' ' || (c as u32) < 0x20))
+}
+
+fn quote_path(path: &str, needs_quoting: bool) -> String {
     if !needs_quoting {
         return path.to_string();
     }
@@ -890,6 +972,31 @@ BLOBEOF\n";
             Event::Blob(blob) => assert_eq!(blob.data, b"BLOBEOFX\n"),
             _ => panic!("expected a blob event"),
         }
+    }
+
+    #[test]
+    fn round_trips_filecopy_filerename_and_deleteall() {
+        let stream = "blob\n\
+mark :1\n\
+data 5\n\
+hello\n\
+commit refs/heads/main\n\
+committer C O Mitter <committer@example.com> 1112911993 -0700\n\
+data 10\n\
+first work\n\
+M 100644 :1 \"file with space.txt\"\n\
+\n\
+commit refs/heads/main\n\
+committer C O Mitter <committer@example.com> 1112912000 -0700\n\
+data 11\n\
+second work\n\
+C \"file with space.txt\" copy.txt\n\
+R copy.txt renamed.txt\n\
+deleteall\n\
+\n\
+done\n";
+
+        assert_eq!(round_trip(stream), stream.as_bytes());
     }
 
     #[test]

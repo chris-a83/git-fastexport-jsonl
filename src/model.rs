@@ -22,6 +22,9 @@ pub struct FileModify {
 pub enum FileChange {
     Modify(FileModify),
     Delete { path: String },
+    Copy { src: String, dst: String },
+    Rename { src: String, dst: String },
+    DeleteAll,
     Note(NoteModify),
 }
 
@@ -307,6 +310,17 @@ fn file_change_to_json(change: &FileChange) -> Value {
             ("op".to_string(), Value::String("D".to_string())),
             ("path".to_string(), Value::String(path.clone())),
         ]),
+        FileChange::Copy { src, dst } => Value::Object(vec![
+            ("op".to_string(), Value::String("C".to_string())),
+            ("src".to_string(), Value::String(src.clone())),
+            ("dst".to_string(), Value::String(dst.clone())),
+        ]),
+        FileChange::Rename { src, dst } => Value::Object(vec![
+            ("op".to_string(), Value::String("R".to_string())),
+            ("src".to_string(), Value::String(src.clone())),
+            ("dst".to_string(), Value::String(dst.clone())),
+        ]),
+        FileChange::DeleteAll => Value::Object(vec![("op".to_string(), Value::String("deleteall".to_string()))]),
         FileChange::Note(note) => Value::Object(vec![
             ("op".to_string(), Value::String("N".to_string())),
             ("dataref".to_string(), dataref_to_json(&note.dataref)),
@@ -326,6 +340,33 @@ fn file_change_from_json(value: &Value) -> Result<FileChange, String> {
                 .to_string();
             Ok(FileChange::Delete { path })
         }
+        "C" => {
+            let src = value
+                .get("src")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "filecopy missing \"src\"".to_string())?
+                .to_string();
+            let dst = value
+                .get("dst")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "filecopy missing \"dst\"".to_string())?
+                .to_string();
+            Ok(FileChange::Copy { src, dst })
+        }
+        "R" => {
+            let src = value
+                .get("src")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "filerename missing \"src\"".to_string())?
+                .to_string();
+            let dst = value
+                .get("dst")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "filerename missing \"dst\"".to_string())?
+                .to_string();
+            Ok(FileChange::Rename { src, dst })
+        }
+        "deleteall" => Ok(FileChange::DeleteAll),
         "M" => {
             let mode = value
                 .get("mode")
