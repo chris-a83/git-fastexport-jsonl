@@ -276,6 +276,33 @@ impl PersonStamp {
     }
 }
 
+// Replaces every author, committer, and tagger identity in the stream with a
+// single fixed name/email, leaving timestamps and tz offsets untouched. This
+// is the common "scrub real names before publishing history" case; anything
+// more selective (redact one address, map old to new) is still a job for
+// sed on the JSON Lines output.
+pub fn redact_authors(events: &mut [Event], name: &Option<String>, email: &str) {
+    for event in events {
+        match event {
+            Event::Commit(commit) => {
+                if let Some(author) = &mut commit.author {
+                    author.name = name.clone();
+                    author.email = email.to_string();
+                }
+                commit.committer.name = name.clone();
+                commit.committer.email = email.to_string();
+            }
+            Event::Tag(tag) => {
+                if let Some(tagger) = &mut tag.tagger {
+                    tagger.name = name.clone();
+                    tagger.email = email.to_string();
+                }
+            }
+            Event::Blob(_) | Event::Reset(_) | Event::Done => {}
+        }
+    }
+}
+
 pub fn is_valid_tz_offset(s: &str) -> bool {
     let bytes = s.as_bytes();
     bytes.len() == 5 && (bytes[0] == b'+' || bytes[0] == b'-') && bytes[1..].iter().all(u8::is_ascii_digit)
@@ -480,5 +507,89 @@ fn base64_decode_char(b: u8) -> Result<u32, String> {
         b'+' => Ok(62),
         b'/' => Ok(63),
         _ => Err(format!("invalid base64 character: {}", b as char)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stamp(name: &str, email: &str) -> PersonStamp {
+        PersonStamp {
+            name: Some(name.to_string()),
+            email: email.to_string(),
+            timestamp: 1112911993,
+            tz_offset: "-0700".to_string(),
+        }
+    }
+
+    #[test]
+    fn redact_authors_overwrites_commit_and_tag_identities_but_not_timestamps() {
+        let mut events = vec![
+            Event::Commit(Commit {
+                branch: "refs/heads/main".to_string(),
+                mark: Some(1),
+                author: Some(stamp("A U Thor", "author@example.com")),
+                committer: stamp("C O Mitter", "committer@example.com"),
+                message: b"work".to_vec(),
+                from: None,
+                merges: Vec::new(),
+                file_changes: Vec::new(),
+            }),
+            Event::Tag(Tag {
+                name: "v1.0".to_string(),
+                mark: None,
+                from: ":1".to_string(),
+                tagger: Some(stamp("T Agger", "tagger@example.com")),
+                message: b"release".to_vec(),
+            }),
+        ];
+
+        redact_authors(&mut events, &Some("Anonymous".to_string()), "anon@example.com");
+
+        match &events[0] {
+            Event::Commit(commit) => {
+                let author = commit.author.as_ref().unwrap();
+                assert_eq!(author.name.as_deref(), Some("Anonymous"));
+                assert_eq!(author.email, "anon@example.com");
+                assert_eq!(author.timestamp, 1112911993);
+                assert_eq!(commit.committer.name.as_deref(), Some("Anonymous"));
+                assert_eq!(commit.committer.email, "anon@example.com");
+            }
+            _ => panic!("expected a commit event"),
+        }
+        match &events[1] {
+            Event::Tag(tag) => {
+                let tagger = tag.tagger.as_ref().unwrap();
+                assert_eq!(tagger.name.as_deref(), Some("Anonymous"));
+                assert_eq!(tagger.email, "anon@example.com");
+            }
+            _ => panic!("expected a tag event"),
+        }
+    }
+
+    #[test]
+    fn redact_authors_leaves_commits_without_an_author_line_absent() {
+        let mut events = vec![Event::Commit(Commit {
+            branch: "refs/heads/main".to_string(),
+            mark: None,
+            author: None,
+            committer: stamp("C O Mitter", "committer@example.com"),
+            message: b"work".to_vec(),
+            from: None,
+            merges: Vec::new(),
+            file_changes: Vec::new(),
+        })];
+
+        redact_authors(&mut events, &None, "anon@example.com");
+
+        match &events[0] {
+            Event::Commit(commit) => {
+                assert!(commit.author.is_none());
+                assert_eq!(commit.committer.name, None);
+                assert_eq!(commit.committer.email, "anon@example.com");
+            }
+            _ => panic!("expected a commit event"),
+        }
     }
 }

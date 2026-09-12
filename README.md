@@ -69,6 +69,23 @@ not exact.
 fastexport-jsonl to-jsonl --lenient < weird-export.stream > history.jsonl
 ```
 
+## Scrubbing identities
+
+`--redact-author` replaces every author, committer, and tagger name and email
+in the stream with a fixed identity, leaving timestamps and tz offsets alone.
+It works on either command, so you can scrub on the way in, on the way back
+out, or both:
+
+```
+git fast-export --all \
+  | fastexport-jsonl to-jsonl --redact-author="Anonymous <anon@example.com>" \
+  > history.jsonl
+```
+
+This is a blunt instrument by design — it replaces everyone, not one address.
+Mapping specific old emails to new ones is still a `sed` job on the JSON
+Lines output, same as any other rewrite.
+
 ## Building
 
 ```
