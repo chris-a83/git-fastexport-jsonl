@@ -26,6 +26,7 @@ pub enum FileChange {
     Rename { src: String, dst: String },
     DeleteAll,
     Note(NoteModify),
+    Ls { path: String },
 }
 
 pub struct NoteModify {
@@ -67,6 +68,8 @@ pub enum Event {
     Commit(Commit),
     Reset(Reset),
     Tag(Tag),
+    Ls { dataref: String, path: String },
+    Checkpoint,
     Done,
 }
 
@@ -84,6 +87,12 @@ impl Event {
                 ("from".to_string(), optional_string(&reset.from)),
             ]),
             Event::Done => Value::Object(vec![("type".to_string(), Value::String("done".to_string()))]),
+            Event::Checkpoint => Value::Object(vec![("type".to_string(), Value::String("checkpoint".to_string()))]),
+            Event::Ls { dataref, path } => Value::Object(vec![
+                ("type".to_string(), Value::String("ls".to_string())),
+                ("dataref".to_string(), Value::String(dataref.clone())),
+                ("path".to_string(), Value::String(path.clone())),
+            ]),
             Event::Tag(tag) => {
                 let tagger = match &tag.tagger {
                     Some(person) => person.to_json(),
@@ -148,6 +157,20 @@ impl Event {
                 Ok(Event::Reset(Reset { branch, from }))
             }
             "done" => Ok(Event::Done),
+            "checkpoint" => Ok(Event::Checkpoint),
+            "ls" => {
+                let dataref = value
+                    .get("dataref")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "ls missing \"dataref\"".to_string())?
+                    .to_string();
+                let path = value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "ls missing \"path\"".to_string())?
+                    .to_string();
+                Ok(Event::Ls { dataref, path })
+            }
             "tag" => {
                 let name = value
                     .get("name")
@@ -298,7 +321,7 @@ pub fn redact_authors(events: &mut [Event], name: &Option<String>, email: &str) 
                     tagger.email = email.to_string();
                 }
             }
-            Event::Blob(_) | Event::Reset(_) | Event::Done => {}
+            Event::Blob(_) | Event::Reset(_) | Event::Ls { .. } | Event::Checkpoint | Event::Done => {}
         }
     }
 }
@@ -352,6 +375,10 @@ fn file_change_to_json(change: &FileChange) -> Value {
             ("op".to_string(), Value::String("N".to_string())),
             ("dataref".to_string(), dataref_to_json(&note.dataref)),
             ("commitish".to_string(), Value::String(note.commitish.clone())),
+        ]),
+        FileChange::Ls { path } => Value::Object(vec![
+            ("op".to_string(), Value::String("ls".to_string())),
+            ("path".to_string(), Value::String(path.clone())),
         ]),
     }
 }
@@ -420,6 +447,14 @@ fn file_change_from_json(value: &Value) -> Result<FileChange, String> {
                 .ok_or_else(|| "notemodify missing \"commitish\"".to_string())?
                 .to_string();
             Ok(FileChange::Note(NoteModify { dataref, commitish }))
+        }
+        "ls" => {
+            let path = value
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "ls missing \"path\"".to_string())?
+                .to_string();
+            Ok(FileChange::Ls { path })
         }
         other => Err(format!("unknown file change op: {}", other)),
     }

@@ -1,11 +1,11 @@
 // Reader and writer for the text stream produced by `git fast-export` and
-// consumed by `git fast-import`. Only the subset of commands that shows up in
-// an ordinary linear-to-moderately-branched export is handled: blob, commit,
-// reset, tag, notemodify, filecopy, filerename, deleteall, and done. `ls` and
-// `checkpoint` are out of scope for now (see README). Both forms of `data`
-// are accepted on input (exact byte count and delimited `<<EOF`); output
-// always uses the exact byte count form, since it's unambiguous and easier
-// for downstream tools to parse.
+// consumed by `git fast-import`. Handles blob, commit, reset, tag, ls,
+// checkpoint, notemodify, filecopy, filerename, deleteall, and done - the
+// commands that show up in an ordinary export plus the query/control ones
+// fast-import itself accepts. Both forms of `data` are accepted on input
+// (exact byte count and delimited `<<EOF`); output always uses the exact
+// byte count form, since it's unambiguous and easier for downstream tools
+// to parse.
 
 use std::collections::HashSet;
 
@@ -139,6 +139,11 @@ pub fn parse(input: &[u8], opts: &ParseOptions) -> Result<Vec<Event>, ParseError
                 known_marks.insert(mark);
             }
             events.push(Event::Tag(tag));
+        } else if let Some(rest) = strip_prefix(line, b"ls ") {
+            let (dataref, path) = parse_ls_standalone(rest, opts, &known_marks, line_no)?;
+            events.push(Event::Ls { dataref, path });
+        } else if line == b"checkpoint" {
+            events.push(Event::Checkpoint);
         } else if line == b"done" {
             events.push(Event::Done);
             break;
@@ -252,6 +257,12 @@ fn parse_commit(
                 cur.read_line();
                 file_changes.push(FileChange::DeleteAll);
             }
+            Some(line) if strip_prefix(line, b"ls ").is_some() => {
+                let (line_no, line) = cur.read_line().unwrap();
+                let rest = strip_prefix(line, b"ls ").unwrap();
+                let path = unquote_path(rest, opts, line_no)?;
+                file_changes.push(FileChange::Ls { path });
+            }
             _ => break,
         }
     }
@@ -336,6 +347,25 @@ fn parse_notemodify(
     let commitish = resolve_commitish(commitish_bytes, opts, known_marks, line_no)?;
 
     Ok(NoteModify { dataref, commitish })
+}
+
+// The standalone form of `ls` (outside of a commit) names the tree to look
+// in explicitly: `ls <dataref> <path>`, where dataref is a mark, sha1, or
+// ref name, same as `from`/`merge`. Inside a commit it's just `ls <path>`,
+// implicitly querying the tree being built (see the file-change loop above).
+fn parse_ls_standalone(
+    rest: &[u8],
+    opts: &ParseOptions,
+    known_marks: &HashSet<u64>,
+    line_no: usize,
+) -> Result<(String, String), ParseError> {
+    let mut parts = rest.splitn(2, |&b| b == b' ');
+    let dataref_bytes =
+        parts.next().ok_or_else(|| ParseError { line: line_no, message: "ls missing dataref".to_string() })?;
+    let path_bytes = parts.next().ok_or_else(|| ParseError { line: line_no, message: "ls missing path".to_string() })?;
+    let dataref = resolve_commitish(dataref_bytes, opts, known_marks, line_no)?;
+    let path = unquote_path(path_bytes, opts, line_no)?;
+    Ok((dataref, path))
 }
 
 fn parse_data(cur: &mut Cursor, opts: &ParseOptions) -> Result<Vec<u8>, ParseError> {
@@ -631,6 +661,14 @@ pub fn write(events: &[Event]) -> Vec<u8> {
             Event::Commit(commit) => write_commit(&mut out, commit),
             Event::Reset(reset) => write_reset(&mut out, reset),
             Event::Tag(tag) => write_tag(&mut out, tag),
+            Event::Ls { dataref, path } => {
+                out.extend_from_slice(b"ls ");
+                out.extend_from_slice(dataref.as_bytes());
+                out.push(b' ');
+                out.extend_from_slice(quote_path_if_needed(path).as_bytes());
+                out.push(b'\n');
+            }
+            Event::Checkpoint => out.extend_from_slice(b"checkpoint\n"),
             Event::Done => out.extend_from_slice(b"done\n"),
         }
     }
@@ -727,6 +765,11 @@ fn write_file_change(out: &mut Vec<u8>, change: &FileChange) {
             out.push(b'\n');
         }
         FileChange::DeleteAll => out.extend_from_slice(b"deleteall\n"),
+        FileChange::Ls { path } => {
+            out.extend_from_slice(b"ls ");
+            out.extend_from_slice(quote_path_if_needed(path).as_bytes());
+            out.push(b'\n');
+        }
         FileChange::Note(note) => {
             out.extend_from_slice(b"N ");
             match &note.dataref {
@@ -994,6 +1037,28 @@ C \"file with space.txt\" copy.txt\n\
 R copy.txt renamed.txt\n\
 deleteall\n\
 \n\
+done\n";
+
+        assert_eq!(round_trip(stream), stream.as_bytes());
+    }
+
+    #[test]
+    fn round_trips_ls_and_checkpoint() {
+        let stream = "blob\n\
+mark :1\n\
+data 5\n\
+hello\n\
+commit refs/heads/main\n\
+mark :2\n\
+committer C O Mitter <committer@example.com> 1112911993 -0700\n\
+data 10\n\
+first work\n\
+M 100644 :1 file.txt\n\
+ls file.txt\n\
+\n\
+checkpoint\n\
+ls :2 file.txt\n\
+ls da39a3ee5e6b4b0d3255bfef95601890afd80709 other.txt\n\
 done\n";
 
         assert_eq!(round_trip(stream), stream.as_bytes());
