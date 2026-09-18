@@ -111,8 +111,24 @@ fn starts_with_peek(cur: &Cursor, prefix: &[u8]) -> bool {
 }
 
 pub fn parse(input: &[u8], opts: &ParseOptions) -> Result<Vec<Event>, ParseError> {
-    let mut cur = Cursor::new(input);
     let mut events = Vec::new();
+    parse_each(input, opts, |event| {
+        events.push(event);
+        Ok(())
+    })?;
+    Ok(events)
+}
+
+// Parses the stream one event at a time, handing each to `on_event` as soon
+// as it's complete rather than collecting the whole history first. This
+// keeps at most one event's worth of decoded data (plus whatever `on_event`
+// itself retains, ideally nothing) resident at once instead of the full
+// parsed history sitting in memory alongside the output being built from it.
+pub fn parse_each<F>(input: &[u8], opts: &ParseOptions, mut on_event: F) -> Result<(), ParseError>
+where
+    F: FnMut(Event) -> Result<(), ParseError>,
+{
+    let mut cur = Cursor::new(input);
     let mut known_marks: HashSet<u64> = HashSet::new();
 
     while let Some((line_no, line)) = cur.read_line() {
@@ -124,28 +140,28 @@ pub fn parse(input: &[u8], opts: &ParseOptions) -> Result<Vec<Event>, ParseError
             if let Some(mark) = blob.mark {
                 known_marks.insert(mark);
             }
-            events.push(Event::Blob(blob));
+            on_event(Event::Blob(blob))?;
         } else if let Some(rest) = strip_prefix(line, b"commit ") {
             let commit = parse_commit(&mut cur, rest, opts, &known_marks)?;
             if let Some(mark) = commit.mark {
                 known_marks.insert(mark);
             }
-            events.push(Event::Commit(commit));
+            on_event(Event::Commit(commit))?;
         } else if let Some(rest) = strip_prefix(line, b"reset ") {
-            events.push(Event::Reset(parse_reset(&mut cur, rest)?));
+            on_event(Event::Reset(parse_reset(&mut cur, rest)?))?;
         } else if let Some(rest) = strip_prefix(line, b"tag ") {
             let tag = parse_tag(&mut cur, rest, opts, &known_marks)?;
             if let Some(mark) = tag.mark {
                 known_marks.insert(mark);
             }
-            events.push(Event::Tag(tag));
+            on_event(Event::Tag(tag))?;
         } else if let Some(rest) = strip_prefix(line, b"ls ") {
             let (dataref, path) = parse_ls_standalone(rest, opts, &known_marks, line_no)?;
-            events.push(Event::Ls { dataref, path });
+            on_event(Event::Ls { dataref, path })?;
         } else if line == b"checkpoint" {
-            events.push(Event::Checkpoint);
+            on_event(Event::Checkpoint)?;
         } else if line == b"done" {
-            events.push(Event::Done);
+            on_event(Event::Done)?;
             break;
         } else if opts.lenient {
             continue;
@@ -157,7 +173,7 @@ pub fn parse(input: &[u8], opts: &ParseOptions) -> Result<Vec<Event>, ParseError
         }
     }
 
-    Ok(events)
+    Ok(())
 }
 
 fn parse_blob(cur: &mut Cursor, opts: &ParseOptions) -> Result<Blob, ParseError> {
@@ -656,23 +672,27 @@ fn unquote_c_string(bytes: &[u8], opts: &ParseOptions, line_no: usize) -> Result
 pub fn write(events: &[Event]) -> Vec<u8> {
     let mut out = Vec::new();
     for event in events {
-        match event {
-            Event::Blob(blob) => write_blob(&mut out, blob),
-            Event::Commit(commit) => write_commit(&mut out, commit),
-            Event::Reset(reset) => write_reset(&mut out, reset),
-            Event::Tag(tag) => write_tag(&mut out, tag),
-            Event::Ls { dataref, path } => {
-                out.extend_from_slice(b"ls ");
-                out.extend_from_slice(dataref.as_bytes());
-                out.push(b' ');
-                out.extend_from_slice(quote_path_if_needed(path).as_bytes());
-                out.push(b'\n');
-            }
-            Event::Checkpoint => out.extend_from_slice(b"checkpoint\n"),
-            Event::Done => out.extend_from_slice(b"done\n"),
-        }
+        write_event(&mut out, event);
     }
     out
+}
+
+pub fn write_event(out: &mut Vec<u8>, event: &Event) {
+    match event {
+        Event::Blob(blob) => write_blob(out, blob),
+        Event::Commit(commit) => write_commit(out, commit),
+        Event::Reset(reset) => write_reset(out, reset),
+        Event::Tag(tag) => write_tag(out, tag),
+        Event::Ls { dataref, path } => {
+            out.extend_from_slice(b"ls ");
+            out.extend_from_slice(dataref.as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(quote_path_if_needed(path).as_bytes());
+            out.push(b'\n');
+        }
+        Event::Checkpoint => out.extend_from_slice(b"checkpoint\n"),
+        Event::Done => out.extend_from_slice(b"done\n"),
+    }
 }
 
 fn write_blob(out: &mut Vec<u8>, blob: &Blob) {

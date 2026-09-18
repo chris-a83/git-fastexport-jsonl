@@ -97,7 +97,10 @@ for blob data are both hand-rolled in `src/`.
 
 ## Current limitations
 
-- the whole stream is read into memory rather than processed incrementally
+- the input file (or stdin) is read into memory in full before conversion
+  starts, so the input itself still sets a memory floor; events are converted
+  and written one at a time after that, so the parsed history and the output
+  are no longer both held in memory at once on top of it
 
 Both `data` forms are accepted on input — the exact byte count form and the
 delimited `data <<DELIM` form some tools emit — but output always uses the

@@ -56,9 +56,11 @@ fn main() -> ExitCode {
         }
     };
 
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
     let result = match command {
-        "to-jsonl" => to_jsonl(&input, lenient, redact_author.as_ref()),
-        "to-fastexport" => to_fastexport(&input, lenient, redact_author.as_ref()),
+        "to-jsonl" => to_jsonl(&input, lenient, redact_author.as_ref(), &mut out),
+        "to-fastexport" => to_fastexport(&input, lenient, redact_author.as_ref(), &mut out),
         other => {
             eprintln!("unknown command: {}", other);
             print_usage();
@@ -66,14 +68,8 @@ fn main() -> ExitCode {
         }
     };
 
-    match result {
-        Ok(output) => match io::stdout().write_all(&output) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                eprintln!("failed to write output: {}", err);
-                ExitCode::FAILURE
-            }
-        },
+    match result.and_then(|()| out.flush().map_err(|e| format!("failed to write output: {}", e))) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("{}", message);
             ExitCode::FAILURE
@@ -149,34 +145,50 @@ fn read_input(path: Option<&str>) -> io::Result<Vec<u8>> {
     }
 }
 
-fn to_jsonl(input: &[u8], lenient: bool, redact_author: Option<&(Option<String>, String)>) -> Result<Vec<u8>, String> {
+// Both directions hand each event to the writer as soon as it's ready
+// instead of collecting the whole history into a Vec<Event> and then a
+// second Vec<u8> of output: the two buffers used to be alive at once, each
+// roughly the size of the full converted history.
+fn to_jsonl(
+    input: &[u8],
+    lenient: bool,
+    redact_author: Option<&(Option<String>, String)>,
+    out: &mut impl Write,
+) -> Result<(), String> {
     let opts = fastexport::ParseOptions { lenient };
-    let mut events = fastexport::parse(input, &opts).map_err(|e| e.to_string())?;
-    if let Some((name, email)) = redact_author {
-        model::redact_authors(&mut events, name, email);
-    }
-    let mut out = Vec::new();
-    for event in &events {
-        out.extend_from_slice(event.to_json().to_compact_string().as_bytes());
-        out.push(b'\n');
-    }
-    Ok(out)
+    fastexport::parse_each(input, &opts, |mut event| {
+        if let Some((name, email)) = redact_author {
+            model::redact_author_event(&mut event, name, email);
+        }
+        let line = event.to_json().to_compact_string();
+        out.write_all(line.as_bytes())
+            .and_then(|()| out.write_all(b"\n"))
+            .map_err(|e| fastexport::ParseError { line: 0, message: format!("failed to write output: {}", e) })
+    })
+    .map_err(|e| e.to_string())
 }
 
-fn to_fastexport(input: &[u8], lenient: bool, redact_author: Option<&(Option<String>, String)>) -> Result<Vec<u8>, String> {
+fn to_fastexport(
+    input: &[u8],
+    lenient: bool,
+    redact_author: Option<&(Option<String>, String)>,
+    out: &mut impl Write,
+) -> Result<(), String> {
     let text = std::str::from_utf8(input).map_err(|_| "input is not valid UTF-8".to_string())?;
-    let mut events = Vec::new();
+    let mut buf = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         let value = json::parse(trimmed).map_err(|e| format!("line {}: {}", i + 1, e))?;
-        let event = model::Event::from_json(&value, lenient).map_err(|e| format!("line {}: {}", i + 1, e))?;
-        events.push(event);
+        let mut event = model::Event::from_json(&value, lenient).map_err(|e| format!("line {}: {}", i + 1, e))?;
+        if let Some((name, email)) = redact_author {
+            model::redact_author_event(&mut event, name, email);
+        }
+        buf.clear();
+        fastexport::write_event(&mut buf, &event);
+        out.write_all(&buf).map_err(|e| format!("line {}: failed to write output: {}", i + 1, e))?;
     }
-    if let Some((name, email)) = redact_author {
-        model::redact_authors(&mut events, name, email);
-    }
-    Ok(fastexport::write(&events))
+    Ok(())
 }

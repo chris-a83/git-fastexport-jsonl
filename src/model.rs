@@ -306,23 +306,27 @@ impl PersonStamp {
 // sed on the JSON Lines output.
 pub fn redact_authors(events: &mut [Event], name: &Option<String>, email: &str) {
     for event in events {
-        match event {
-            Event::Commit(commit) => {
-                if let Some(author) = &mut commit.author {
-                    author.name = name.clone();
-                    author.email = email.to_string();
-                }
-                commit.committer.name = name.clone();
-                commit.committer.email = email.to_string();
+        redact_author_event(event, name, email);
+    }
+}
+
+pub fn redact_author_event(event: &mut Event, name: &Option<String>, email: &str) {
+    match event {
+        Event::Commit(commit) => {
+            if let Some(author) = &mut commit.author {
+                author.name = name.clone();
+                author.email = email.to_string();
             }
-            Event::Tag(tag) => {
-                if let Some(tagger) = &mut tag.tagger {
-                    tagger.name = name.clone();
-                    tagger.email = email.to_string();
-                }
-            }
-            Event::Blob(_) | Event::Reset(_) | Event::Ls { .. } | Event::Checkpoint | Event::Done => {}
+            commit.committer.name = name.clone();
+            commit.committer.email = email.to_string();
         }
+        Event::Tag(tag) => {
+            if let Some(tagger) = &mut tag.tagger {
+                tagger.name = name.clone();
+                tagger.email = email.to_string();
+            }
+        }
+        Event::Blob(_) | Event::Reset(_) | Event::Ls { .. } | Event::Checkpoint | Event::Done => {}
     }
 }
 
