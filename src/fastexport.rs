@@ -8,6 +8,7 @@
 // to parse.
 
 use std::collections::HashSet;
+use std::io::{BufRead, Read};
 
 use crate::model::{
     is_valid_tz_offset, Blob, Commit, DataRef, Event, FileChange, FileModify, NoteModify, PersonStamp, Reset, Tag,
@@ -29,68 +30,104 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+// Pulls lines and exact-length payloads out of a buffered reader. The parser
+// needs one line of lookahead (is the next line `author`, `from`, `M ...`?),
+// which is held in `peeked` as the raw line including its terminator. Only
+// that one line is ever buffered here; everything else stays in the reader.
 struct Cursor<'a> {
-    data: &'a [u8],
-    pos: usize,
+    reader: &'a mut dyn BufRead,
+    peeked: Option<Vec<u8>>,
     line: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Cursor { data, pos: 0, line: 1 }
+    fn new(reader: &'a mut dyn BufRead) -> Self {
+        Cursor { reader, peeked: None, line: 1 }
     }
 
-    fn is_eof(&self) -> bool {
-        self.pos >= self.data.len()
+    fn io_error(&self, err: std::io::Error) -> ParseError {
+        ParseError { line: self.line, message: format!("failed to read input: {}", err) }
     }
 
-    fn read_line(&mut self) -> Option<(usize, &'a [u8])> {
-        if self.is_eof() {
-            return None;
+    fn fill_peeked(&mut self) -> Result<(), ParseError> {
+        if self.peeked.is_none() {
+            let mut buf = Vec::new();
+            let n = self.reader.read_until(b'\n', &mut buf).map_err(|e| self.io_error(e))?;
+            if n > 0 {
+                self.peeked = Some(buf);
+            }
         }
-        let line_no = self.line;
-        let start = self.pos;
-        while self.pos < self.data.len() && self.data[self.pos] != b'\n' {
-            self.pos += 1;
-        }
-        let line = &self.data[start..self.pos];
-        if self.pos < self.data.len() {
-            self.pos += 1;
-        }
-        self.line += 1;
-        Some((line_no, line))
+        Ok(())
     }
 
-    fn peek_line(&self) -> Option<&'a [u8]> {
-        if self.is_eof() {
-            return None;
+    fn is_eof(&mut self) -> Result<bool, ParseError> {
+        if self.peeked.is_some() {
+            return Ok(false);
         }
-        let mut end = self.pos;
-        while end < self.data.len() && self.data[end] != b'\n' {
-            end += 1;
-        }
-        Some(&self.data[self.pos..end])
+        let buf = self.reader.fill_buf().map_err(|e| ParseError {
+            line: self.line,
+            message: format!("failed to read input: {}", e),
+        })?;
+        Ok(buf.is_empty())
     }
 
-    fn read_exact(&mut self, n: usize) -> Result<&'a [u8], ParseError> {
-        if self.pos + n > self.data.len() {
+    fn read_line(&mut self) -> Result<Option<(usize, Vec<u8>)>, ParseError> {
+        self.fill_peeked()?;
+        match self.peeked.take() {
+            None => Ok(None),
+            Some(mut raw) => {
+                if raw.last() == Some(&b'\n') {
+                    raw.pop();
+                }
+                let line_no = self.line;
+                self.line += 1;
+                Ok(Some((line_no, raw)))
+            }
+        }
+    }
+
+    // Call only after a peek_line/starts_with_peek that returned a line.
+    fn take_line(&mut self) -> Result<(usize, Vec<u8>), ParseError> {
+        match self.read_line()? {
+            Some(pair) => Ok(pair),
+            None => Err(ParseError { line: self.line, message: "unexpected end of input".to_string() }),
+        }
+    }
+
+    fn peek_line(&mut self) -> Result<Option<&[u8]>, ParseError> {
+        self.fill_peeked()?;
+        Ok(self.peeked.as_deref().map(|raw| raw.strip_suffix(b"\n").unwrap_or(raw)))
+    }
+
+    // Only called right after a command line was consumed with read_line, so
+    // there is never a peeked line pending that would need to be replayed.
+    fn read_exact(&mut self, n: usize) -> Result<Vec<u8>, ParseError> {
+        debug_assert!(self.peeked.is_none());
+        // Growing through `take` rather than allocating `n` up front keeps a
+        // bogus huge length from reserving memory before the read fails.
+        let mut data = Vec::new();
+        let result = (&mut *self.reader).take(n as u64).read_to_end(&mut data);
+        let got = result.map_err(|e| self.io_error(e))?;
+        if got != n {
             return Err(ParseError {
                 line: self.line,
                 message: "unexpected end of input while reading a data payload".to_string(),
             });
         }
-        let bytes = &self.data[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(bytes)
+        Ok(data)
     }
 
-    fn consume_lf_if_present(&mut self) -> bool {
-        if self.pos < self.data.len() && self.data[self.pos] == b'\n' {
-            self.pos += 1;
+    fn consume_lf_if_present(&mut self) -> Result<bool, ParseError> {
+        let buf = self.reader.fill_buf().map_err(|e| ParseError {
+            line: self.line,
+            message: format!("failed to read input: {}", e),
+        })?;
+        if buf.first() == Some(&b'\n') {
+            self.reader.consume(1);
             self.line += 1;
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 }
@@ -103,11 +140,11 @@ fn strip_prefix<'a>(line: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     }
 }
 
-fn starts_with_peek(cur: &Cursor, prefix: &[u8]) -> bool {
-    match cur.peek_line() {
+fn starts_with_peek(cur: &mut Cursor, prefix: &[u8]) -> Result<bool, ParseError> {
+    Ok(match cur.peek_line()? {
         Some(line) => line.starts_with(prefix),
         None => false,
-    }
+    })
 }
 
 pub fn parse(input: &[u8], opts: &ParseOptions) -> Result<Vec<Event>, ParseError> {
@@ -124,14 +161,21 @@ pub fn parse(input: &[u8], opts: &ParseOptions) -> Result<Vec<Event>, ParseError
 // keeps at most one event's worth of decoded data (plus whatever `on_event`
 // itself retains, ideally nothing) resident at once instead of the full
 // parsed history sitting in memory alongside the output being built from it.
-pub fn parse_each<F>(input: &[u8], opts: &ParseOptions, mut on_event: F) -> Result<(), ParseError>
+//
+// The input is read through a buffered reader as the parse advances, so a
+// pipe from `git fast-export` is consumed incrementally rather than being
+// slurped first. A single blob or message is still held whole while it is
+// decoded.
+pub fn parse_each<R, F>(mut input: R, opts: &ParseOptions, mut on_event: F) -> Result<(), ParseError>
 where
+    R: BufRead,
     F: FnMut(Event) -> Result<(), ParseError>,
 {
-    let mut cur = Cursor::new(input);
+    let mut cur = Cursor::new(&mut input);
     let mut known_marks: HashSet<u64> = HashSet::new();
 
-    while let Some((line_no, line)) = cur.read_line() {
+    while let Some((line_no, line)) = cur.read_line()? {
+        let line = line.as_slice();
         if line.is_empty() || line.starts_with(b"#") {
             continue;
         }
@@ -177,14 +221,18 @@ where
 }
 
 fn parse_blob(cur: &mut Cursor, opts: &ParseOptions) -> Result<Blob, ParseError> {
-    let mark = if starts_with_peek(cur, b"mark :") {
-        let (line_no, line) = cur.read_line().unwrap();
-        Some(parse_mark_id(strip_prefix(line, b"mark :").unwrap(), line_no)?)
-    } else {
-        None
-    };
+    let mark = parse_optional_mark(cur)?;
     let data = parse_data(cur, opts)?;
     Ok(Blob { mark, data })
+}
+
+fn parse_optional_mark(cur: &mut Cursor) -> Result<Option<u64>, ParseError> {
+    if starts_with_peek(cur, b"mark :")? {
+        let (line_no, line) = cur.take_line()?;
+        Ok(Some(parse_mark_id(&line[b"mark :".len()..], line_no)?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn parse_commit(
@@ -195,91 +243,84 @@ fn parse_commit(
 ) -> Result<Commit, ParseError> {
     let branch = String::from_utf8_lossy(branch_bytes).trim().to_string();
 
-    let mark = if starts_with_peek(cur, b"mark :") {
-        let (line_no, line) = cur.read_line().unwrap();
-        Some(parse_mark_id(strip_prefix(line, b"mark :").unwrap(), line_no)?)
+    let mark = parse_optional_mark(cur)?;
+
+    let author = if starts_with_peek(cur, b"author ")? {
+        let (line_no, line) = cur.take_line()?;
+        Some(parse_person(&line[b"author ".len()..], line_no, opts)?)
     } else {
         None
     };
 
-    let author = if starts_with_peek(cur, b"author ") {
-        let (line_no, line) = cur.read_line().unwrap();
-        Some(parse_person(strip_prefix(line, b"author ").unwrap(), line_no, opts)?)
-    } else {
-        None
-    };
-
-    let (line_no, line) = cur
-        .read_line()
-        .ok_or_else(|| ParseError { line: cur.line, message: "expected committer line, found end of input".to_string() })?;
-    let committer_rest = strip_prefix(line, b"committer ").ok_or_else(|| ParseError {
+    let (line_no, line) = cur.read_line()?.ok_or_else(|| ParseError {
+        line: cur.line,
+        message: "expected committer line, found end of input".to_string(),
+    })?;
+    let committer_rest = strip_prefix(&line, b"committer ").ok_or_else(|| ParseError {
         line: line_no,
-        message: format!("expected committer line, found: {}", String::from_utf8_lossy(line)),
+        message: format!("expected committer line, found: {}", String::from_utf8_lossy(&line)),
     })?;
     let committer = parse_person(committer_rest, line_no, opts)?;
 
     let message = parse_data(cur, opts)?;
 
-    let from = if starts_with_peek(cur, b"from ") {
-        let (line_no, line) = cur.read_line().unwrap();
-        Some(resolve_commitish(strip_prefix(line, b"from ").unwrap(), opts, known_marks, line_no)?)
+    let from = if starts_with_peek(cur, b"from ")? {
+        let (line_no, line) = cur.take_line()?;
+        Some(resolve_commitish(&line[b"from ".len()..], opts, known_marks, line_no)?)
     } else {
         None
     };
 
     let mut merges = Vec::new();
-    while starts_with_peek(cur, b"merge ") {
-        let (line_no, line) = cur.read_line().unwrap();
-        merges.push(resolve_commitish(strip_prefix(line, b"merge ").unwrap(), opts, known_marks, line_no)?);
+    while starts_with_peek(cur, b"merge ")? {
+        let (line_no, line) = cur.take_line()?;
+        merges.push(resolve_commitish(&line[b"merge ".len()..], opts, known_marks, line_no)?);
     }
 
     let mut file_changes = Vec::new();
     loop {
-        match cur.peek_line() {
+        // Copy the first byte(s) needed to classify the line so the peeked
+        // borrow ends before the cursor is advanced.
+        let kind = match cur.peek_line()? {
             None => break,
             Some(line) if line.is_empty() => {
-                cur.read_line();
+                cur.take_line()?;
                 break;
             }
-            Some(line) if strip_prefix(line, b"M ").is_some() => {
-                let (line_no, line) = cur.read_line().unwrap();
-                let rest = strip_prefix(line, b"M ").unwrap();
-                file_changes.push(FileChange::Modify(parse_filemodify(rest, cur, opts, line_no)?));
+            Some(line) if line.starts_with(b"M ") => b'M',
+            Some(line) if line.starts_with(b"D ") => b'D',
+            Some(line) if line.starts_with(b"N ") => b'N',
+            Some(line) if line.starts_with(b"C ") => b'C',
+            Some(line) if line.starts_with(b"R ") => b'R',
+            Some(line) if line == b"deleteall" => b'A',
+            Some(line) if line.starts_with(b"ls ") => b'L',
+            _ => break,
+        };
+        let (line_no, line) = cur.take_line()?;
+        match kind {
+            b'M' => {
+                file_changes.push(FileChange::Modify(parse_filemodify(&line[2..], cur, opts, line_no)?));
             }
-            Some(line) if strip_prefix(line, b"D ").is_some() => {
-                let (line_no, line) = cur.read_line().unwrap();
-                let rest = strip_prefix(line, b"D ").unwrap();
-                let path = unquote_path(rest, opts, line_no)?;
+            b'D' => {
+                let path = unquote_path(&line[2..], opts, line_no)?;
                 file_changes.push(FileChange::Delete { path });
             }
-            Some(line) if strip_prefix(line, b"N ").is_some() => {
-                let (line_no, line) = cur.read_line().unwrap();
-                let rest = strip_prefix(line, b"N ").unwrap();
-                file_changes.push(FileChange::Note(parse_notemodify(rest, cur, opts, known_marks, line_no)?));
+            b'N' => {
+                file_changes.push(FileChange::Note(parse_notemodify(&line[2..], cur, opts, known_marks, line_no)?));
             }
-            Some(line) if strip_prefix(line, b"C ").is_some() => {
-                let (line_no, line) = cur.read_line().unwrap();
-                let rest = strip_prefix(line, b"C ").unwrap();
-                let (src, dst) = parse_two_paths(rest, opts, line_no)?;
+            b'C' => {
+                let (src, dst) = parse_two_paths(&line[2..], opts, line_no)?;
                 file_changes.push(FileChange::Copy { src, dst });
             }
-            Some(line) if strip_prefix(line, b"R ").is_some() => {
-                let (line_no, line) = cur.read_line().unwrap();
-                let rest = strip_prefix(line, b"R ").unwrap();
-                let (src, dst) = parse_two_paths(rest, opts, line_no)?;
+            b'R' => {
+                let (src, dst) = parse_two_paths(&line[2..], opts, line_no)?;
                 file_changes.push(FileChange::Rename { src, dst });
             }
-            Some(line) if line == b"deleteall" => {
-                cur.read_line();
-                file_changes.push(FileChange::DeleteAll);
-            }
-            Some(line) if strip_prefix(line, b"ls ").is_some() => {
-                let (line_no, line) = cur.read_line().unwrap();
-                let rest = strip_prefix(line, b"ls ").unwrap();
-                let path = unquote_path(rest, opts, line_no)?;
+            b'A' => file_changes.push(FileChange::DeleteAll),
+            _ => {
+                let path = unquote_path(&line[3..], opts, line_no)?;
                 file_changes.push(FileChange::Ls { path });
             }
-            _ => break,
         }
     }
 
@@ -288,9 +329,9 @@ fn parse_commit(
 
 fn parse_reset(cur: &mut Cursor, branch_bytes: &[u8]) -> Result<Reset, ParseError> {
     let branch = String::from_utf8_lossy(branch_bytes).trim().to_string();
-    let from = if starts_with_peek(cur, b"from ") {
-        let (_, line) = cur.read_line().unwrap();
-        Some(String::from_utf8_lossy(strip_prefix(line, b"from ").unwrap()).trim().to_string())
+    let from = if starts_with_peek(cur, b"from ")? {
+        let (_, line) = cur.take_line()?;
+        Some(String::from_utf8_lossy(&line[b"from ".len()..]).trim().to_string())
     } else {
         None
     };
@@ -305,25 +346,21 @@ fn parse_tag(
 ) -> Result<Tag, ParseError> {
     let name = String::from_utf8_lossy(name_bytes).trim().to_string();
 
-    let mark = if starts_with_peek(cur, b"mark :") {
-        let (line_no, line) = cur.read_line().unwrap();
-        Some(parse_mark_id(strip_prefix(line, b"mark :").unwrap(), line_no)?)
-    } else {
-        None
-    };
+    let mark = parse_optional_mark(cur)?;
 
-    let (line_no, line) = cur
-        .read_line()
-        .ok_or_else(|| ParseError { line: cur.line, message: "expected from line, found end of input".to_string() })?;
-    let from_rest = strip_prefix(line, b"from ").ok_or_else(|| ParseError {
+    let (line_no, line) = cur.read_line()?.ok_or_else(|| ParseError {
+        line: cur.line,
+        message: "expected from line, found end of input".to_string(),
+    })?;
+    let from_rest = strip_prefix(&line, b"from ").ok_or_else(|| ParseError {
         line: line_no,
-        message: format!("expected from line, found: {}", String::from_utf8_lossy(line)),
+        message: format!("expected from line, found: {}", String::from_utf8_lossy(&line)),
     })?;
     let from = resolve_commitish(from_rest, opts, known_marks, line_no)?;
 
-    let tagger = if starts_with_peek(cur, b"tagger ") {
-        let (line_no, line) = cur.read_line().unwrap();
-        Some(parse_person(strip_prefix(line, b"tagger ").unwrap(), line_no, opts)?)
+    let tagger = if starts_with_peek(cur, b"tagger ")? {
+        let (line_no, line) = cur.take_line()?;
+        Some(parse_person(&line[b"tagger ".len()..], line_no, opts)?)
     } else {
         None
     };
@@ -385,12 +422,13 @@ fn parse_ls_standalone(
 }
 
 fn parse_data(cur: &mut Cursor, opts: &ParseOptions) -> Result<Vec<u8>, ParseError> {
-    let (line_no, line) = cur
-        .read_line()
-        .ok_or_else(|| ParseError { line: cur.line, message: "expected data command, found end of input".to_string() })?;
-    let rest = strip_prefix(line, b"data ").ok_or_else(|| ParseError {
+    let (line_no, line) = cur.read_line()?.ok_or_else(|| ParseError {
+        line: cur.line,
+        message: "expected data command, found end of input".to_string(),
+    })?;
+    let rest = strip_prefix(&line, b"data ").ok_or_else(|| ParseError {
         line: line_no,
-        message: format!("expected data command, found: {}", String::from_utf8_lossy(line)),
+        message: format!("expected data command, found: {}", String::from_utf8_lossy(&line)),
     })?;
     if let Some(delim) = rest.strip_prefix(b"<<") {
         return parse_delimited_data(cur, delim, line_no, opts);
@@ -401,10 +439,10 @@ fn parse_data(cur: &mut Cursor, opts: &ParseOptions) -> Result<Vec<u8>, ParseErr
     let count: usize = count_str
         .parse()
         .map_err(|_| ParseError { line: line_no, message: format!("invalid data length: {}", count_str) })?;
-    let data = cur.read_exact(count)?.to_vec();
+    let data = cur.read_exact(count)?;
 
-    let had_lf = cur.consume_lf_if_present();
-    if !had_lf && !cur.is_eof() && !opts.lenient {
+    let had_lf = cur.consume_lf_if_present()?;
+    if !had_lf && !cur.is_eof()? && !opts.lenient {
         return Err(ParseError {
             line: line_no,
             message: "data payload must be followed by a newline separator".to_string(),
@@ -425,10 +463,10 @@ fn parse_delimited_data(cur: &mut Cursor, delim: &[u8], line_no: usize, opts: &P
     }
     let mut data = Vec::new();
     loop {
-        match cur.read_line() {
+        match cur.read_line()? {
             Some((_, line)) if line == delim => return Ok(data),
             Some((_, line)) => {
-                data.extend_from_slice(line);
+                data.extend_from_slice(&line);
                 data.push(b'\n');
             }
             None => {
@@ -1082,6 +1120,49 @@ ls da39a3ee5e6b4b0d3255bfef95601890afd80709 other.txt\n\
 done\n";
 
         assert_eq!(round_trip(stream), stream.as_bytes());
+    }
+
+    #[test]
+    fn parsing_through_a_one_byte_buffer_matches_parsing_a_slice() {
+        // A capacity-1 BufReader hands the parser one byte per fill, so every
+        // line, peek, and data payload straddles a buffer boundary.
+        let stream = "blob\n\
+mark :1\n\
+data 11\n\
+two\nlines\n!\n\
+commit refs/heads/main\n\
+mark :2\n\
+committer C O Mitter <committer@example.com> 1112911993 -0700\n\
+data 10\n\
+first work\n\
+M 100644 :1 file.txt\n\
+D gone.txt\n\
+\n\
+blob\n\
+data <<EOF\n\
+delimited\n\
+EOF\n\
+done\n";
+
+        let opts = ParseOptions { lenient: false };
+        let expected = parse(stream.as_bytes(), &opts).expect("slice parse");
+
+        let mut events = Vec::new();
+        let reader = std::io::BufReader::with_capacity(1, stream.as_bytes());
+        parse_each(reader, &opts, |event| {
+            events.push(event);
+            Ok(())
+        })
+        .expect("chunked parse");
+
+        assert_eq!(write(&events), write(&expected));
+    }
+
+    #[test]
+    fn truncated_data_payload_is_an_error() {
+        let stream = "blob\ndata 50\nshort\n";
+        let opts = ParseOptions { lenient: false };
+        assert!(parse(stream.as_bytes(), &opts).is_err());
     }
 
     #[test]

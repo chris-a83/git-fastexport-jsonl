@@ -4,7 +4,7 @@ mod model;
 
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -48,8 +48,8 @@ fn main() -> ExitCode {
         }
     }
 
-    let input = match read_input(input_path.as_deref()) {
-        Ok(data) => data,
+    let input = match open_input(input_path.as_deref()) {
+        Ok(reader) => reader,
         Err(err) => {
             eprintln!("failed to read input: {}", err);
             return ExitCode::FAILURE;
@@ -59,8 +59,8 @@ fn main() -> ExitCode {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     let result = match command {
-        "to-jsonl" => to_jsonl(&input, lenient, redact_author.as_ref(), &mut out),
-        "to-fastexport" => to_fastexport(&input, lenient, redact_author.as_ref(), &mut out),
+        "to-jsonl" => to_jsonl(input, lenient, redact_author.as_ref(), &mut out),
+        "to-fastexport" => to_fastexport(input, lenient, redact_author.as_ref(), &mut out),
         other => {
             eprintln!("unknown command: {}", other);
             print_usage();
@@ -134,14 +134,12 @@ mod tests {
     }
 }
 
-fn read_input(path: Option<&str>) -> io::Result<Vec<u8>> {
+// The input is never read up front: the parsers pull from this reader as they
+// go, so memory use doesn't scale with the size of the stream.
+fn open_input(path: Option<&str>) -> io::Result<Box<dyn BufRead>> {
     match path {
-        None | Some("-") => {
-            let mut buf = Vec::new();
-            io::stdin().read_to_end(&mut buf)?;
-            Ok(buf)
-        }
-        Some(p) => fs::read(p),
+        None | Some("-") => Ok(Box::new(io::BufReader::with_capacity(64 * 1024, io::stdin()))),
+        Some(p) => Ok(Box::new(io::BufReader::with_capacity(64 * 1024, fs::File::open(p)?))),
     }
 }
 
@@ -150,7 +148,7 @@ fn read_input(path: Option<&str>) -> io::Result<Vec<u8>> {
 // second Vec<u8> of output: the two buffers used to be alive at once, each
 // roughly the size of the full converted history.
 fn to_jsonl(
-    input: &[u8],
+    input: impl BufRead,
     lenient: bool,
     redact_author: Option<&(Option<String>, String)>,
     out: &mut impl Write,
@@ -169,26 +167,40 @@ fn to_jsonl(
 }
 
 fn to_fastexport(
-    input: &[u8],
+    mut input: impl BufRead,
     lenient: bool,
     redact_author: Option<&(Option<String>, String)>,
     out: &mut impl Write,
 ) -> Result<(), String> {
-    let text = std::str::from_utf8(input).map_err(|_| "input is not valid UTF-8".to_string())?;
     let mut buf = Vec::new();
-    for (i, line) in text.lines().enumerate() {
-        let trimmed = line.trim();
+    let mut text = String::new();
+    let mut i = 0;
+    loop {
+        text.clear();
+        // read_line reports invalid UTF-8 as InvalidData, which keeps the
+        // old "input is not valid UTF-8" diagnosis for that case.
+        match input.read_line(&mut text) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                return Err(format!("line {}: input is not valid UTF-8", i + 1));
+            }
+            Err(e) => return Err(format!("failed to read input: {}", e)),
+        }
+        // str::lines counted a \r\n or \n as one line; i tracks the same thing.
+        i += 1;
+        let trimmed = text.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let value = json::parse(trimmed).map_err(|e| format!("line {}: {}", i + 1, e))?;
-        let mut event = model::Event::from_json(&value, lenient).map_err(|e| format!("line {}: {}", i + 1, e))?;
+        let value = json::parse(trimmed).map_err(|e| format!("line {}: {}", i, e))?;
+        let mut event = model::Event::from_json(&value, lenient).map_err(|e| format!("line {}: {}", i, e))?;
         if let Some((name, email)) = redact_author {
             model::redact_author_event(&mut event, name, email);
         }
         buf.clear();
         fastexport::write_event(&mut buf, &event);
-        out.write_all(&buf).map_err(|e| format!("line {}: failed to write output: {}", i + 1, e))?;
+        out.write_all(&buf).map_err(|e| format!("line {}: failed to write output: {}", i, e))?;
     }
     Ok(())
 }
